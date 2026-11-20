@@ -11,6 +11,12 @@ The provider interface is small on purpose: one screenshot in, one
 structured layout description out. The Gemini provider additionally
 writes HTML directly from a screenshot and compares two screenshots
 for the self-check loop. Groq and Ollama live calls are NOT wired yet.
+
+Reachability means "can do a live vision call" — not "a server
+answered". An Ollama server that answers /api/tags is up, but its
+live vision calls are unwired, so its probe reports reachable=False
+with a reason that says so, and selection skips it. Never select a
+provider whose live vision calls are not wired.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ __all__ = [
     "GroqVisionProvider",
     "available_providers",
     "select_provider",
+    "analyze_with_fallback",
     "downscale_png",
     "parse_layout_reply",
     "GEMINI_MODEL",
@@ -127,6 +134,10 @@ class VisionProvider(ABC):
     """One screenshot in, one structured layout out."""
 
     name = "vision"
+    # True only when analyze_screenshot makes a real model call.
+    # Selection never picks a provider with this False, however
+    # reachable its server or key looks.
+    live_vision_wired = False
 
     @abstractmethod
     def analyze_screenshot(self, image_bytes: bytes) -> LayoutDescription:
@@ -337,6 +348,8 @@ class GeminiVisionProvider(_EnvVisionProvider):
     name = "gemini"
     env_var = "GEMINI_API_KEY"
     provider_label = "Gemini"
+    # The only provider with live vision calls wired (Phase 2).
+    live_vision_wired = True
 
     def __init__(self, model: str = GEMINI_MODEL,
                  timeout_s: int = VISION_TIMEOUT_S):
@@ -490,7 +503,14 @@ class GroqVisionProvider(_EnvVisionProvider):
 
 
 class OllamaVisionProvider(VisionProvider):
-    """Local Ollama vision. No key — talks to a local server only."""
+    """Local Ollama vision. No key — talks to a local server only.
+
+    Live vision calls are NOT wired yet, so this provider is never
+    selectable: probe() reports reachable=False even when the server
+    answers /api/tags, and the reason says the server is up but the
+    vision calls are unwired. Server availability and vision
+    capability are different facts — never confuse them.
+    """
 
     name = "ollama"
 
@@ -498,10 +518,19 @@ class OllamaVisionProvider(VisionProvider):
         self.host = (host or os.environ.get("OLLAMA_HOST")
                      or "http://127.0.0.1:11434").rstrip("/")
 
+    def _server_up(self) -> bool:
+        """True when the Ollama server answers /api/tags with 200."""
+        try:
+            request = urllib.request.Request(self.host + "/api/tags")
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
     def analyze_screenshot(self, image_bytes: bytes) -> LayoutDescription:
         if not image_bytes:
             raise ValueError("screenshot is empty")
-        if not self.probe().reachable:
+        if not self._server_up():
             raise VisionConfigError(
                 "Ollama is not reachable at "
                 f"{self.host}. Start Ollama and pull a vision model "
@@ -518,16 +547,26 @@ class OllamaVisionProvider(VisionProvider):
         except Exception as exc:  # network down, no server, refused
             return ProbeResult(name=self.name, reachable=False,
                                reason=f"Ollama not reachable: {exc}")
+        if not ok:
+            return ProbeResult(
+                name=self.name, reachable=False,
+                reason="Ollama answered with a non-200 status")
+        # The server is up — but reachable means "can do a live vision
+        # call", and Ollama's live calls are not wired. Say both facts.
         return ProbeResult(
-            name=self.name, reachable=ok,
-            reason="Ollama answered on /api/tags" if ok else
-            "Ollama answered with a non-200 status")
+            name=self.name, reachable=False,
+            reason="Ollama server is up (answered /api/tags) but live "
+                   "vision calls are not wired yet — not selectable as "
+                   "a vision provider")
 
 
 def available_providers() -> list:
     """Reachability for each free-tier route. Makes no model calls.
 
-    Ollama is probed over local HTTP (no key). Gemini reports key
+    "Reachable" means the provider can do a live vision call — not
+    just that a server answered or a key is set. Ollama reports
+    reachable=False while its live calls are unwired, even when its
+    server answers /api/tags; the reason says so. Gemini reports key
     presence only — presence is not proof the key works. Groq is
     never reachable: its live calls are not wired.
     """
@@ -538,15 +577,61 @@ def available_providers() -> list:
     )]
 
 
-def select_provider() -> VisionProvider:
-    """First reachable provider, else the stub (tests/offline only).
+def _providers_by_name() -> dict:
+    return {"ollama": OllamaVisionProvider(),
+            "gemini": GeminiVisionProvider(),
+            "groq": GroqVisionProvider()}
 
-    The stub is returned with its name so callers can say honestly that
-    no live vision ran.
+
+def select_provider() -> VisionProvider:
+    """First reachable AND live-vision-wired provider, else the stub.
+
+    A provider is selectable only when its probe says reachable and
+    its live vision calls are wired. A reachable-but-unwired Ollama
+    is skipped, never selected. The stub is returned only when no
+    live provider is usable, with its name, so callers can say
+    honestly that no live vision ran.
     """
+    providers = _providers_by_name()
     for probe in available_providers():
-        if probe.reachable:
-            return {"ollama": OllamaVisionProvider(),
-                    "gemini": GeminiVisionProvider(),
-                    "groq": GroqVisionProvider()}[probe.name]
+        if not probe.reachable:
+            continue
+        provider = providers[probe.name]
+        if provider.live_vision_wired:
+            return provider
     return StubVisionProvider()
+
+
+def analyze_with_fallback(image_bytes: bytes):
+    """Try each usable free provider in PROVIDER_ORDER until one works.
+
+    Returns (provider_name, LayoutDescription). A provider is tried
+    only when its live vision calls are wired and its probe says
+    reachable; a live call that fails falls through to the next
+    usable free provider. One attempt per provider per call — no
+    retries, never hammer a failing provider. If every provider
+    fails (or none is usable), raises VisionError naming each
+    provider tried and why each failed. It never falls back to the
+    stub and never presents a failure as a result. Free-tier only:
+    no paid provider is ever tried.
+    """
+    attempts = []
+    providers = _providers_by_name()
+    for name in PROVIDER_ORDER:
+        provider = providers[name]
+        if not provider.live_vision_wired:
+            attempts.append((name, "live vision calls are not wired yet"))
+            continue
+        probe = provider.probe()
+        if not probe.reachable:
+            attempts.append((name, probe.reason))
+            continue
+        try:
+            return provider.name, provider.analyze_screenshot(image_bytes)
+        except (VisionError, VisionConfigError) as exc:
+            attempts.append((name, str(exc)))
+            continue
+    detail = "; ".join(f"{name}: {why}" for name, why in attempts)
+    raise VisionError(
+        "all free vision providers failed — "
+        f"{detail}. No live vision ran; no result was produced.")

@@ -6,8 +6,11 @@ HTML page in the VektorFlow design system (dark theme, cyan accent).
 Phase 2 (direct path): the vision model writes the HTML itself and
 ``generate_page_direct`` puts it through the same safety gates —
 secret scan, no ``javascript:`` links, no inline event handlers, no
-non-allowlisted external URLs (Tailwind CDN only). The template path
-is unchanged; the direct path is what makes a rebuild look like the
+non-allowlisted external URLs (Tailwind CDN only), no inline
+``<script>`` blocks (only the exact Tailwind CDN script tag is
+allowed), and validated resource URLs in ``src``, ``href``,
+``action``, ``formaction``, and ``srcset``. The template path is
+unchanged; the direct path is what makes a rebuild look like the
 original instead of a generic sketch.
 
 Safety rules, enforced here:
@@ -18,6 +21,8 @@ Safety rules, enforced here:
   in verify.py).
 - Any text that looks like a secret (API key, token, bearer value)
   refuses to generate: generated code must never embed credentials.
+- Model-written HTML is untrusted input: anything that fails a gate
+  is refused with a named reason — never silently cleaned up.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ import re
 from .models import BRAND, GeneratedPage, LayoutDescription
 
 __all__ = ["generate_page", "generate_page_direct", "extract_html",
-           "SECRET_PATTERNS"]
+           "scan_direct_violations", "SECRET_PATTERNS"]
 
 # Patterns that must never appear in generated code. The same list is
 # used by verify.py; keep them in sync.
@@ -154,16 +159,138 @@ def generate_page(layout, title=None, model="stub"):
 # --- Phase 2: model-driven generation --------------------------------
 
 # The direct path mirrors these checks from verify.py (which imports
-# SECRET_PATTERNS and TAILWIND_CDN from here, so the patterns stay in
-# sync by construction). A model-written page is untrusted input: it
-# goes through the same gates the template path enforces, and anything
+# scan_direct_violations from here, so the two gates stay in sync by
+# construction). A model-written page is untrusted input: it goes
+# through the same gates the template path enforces, and anything
 # that fails is refused — never silently cleaned up.
-_DIRECT_URL_ATTRS = re.compile(
-    r'''(?:src|href)\s*=\s*["']([^"']+)["']''', re.IGNORECASE)
-_DIRECT_JS_HREF = re.compile(
-    r'''href\s*=\s*["']\s*javascript:''', re.IGNORECASE)
 _DIRECT_EVENT_ATTR = re.compile(r'''\son\w+\s*=''', re.IGNORECASE)
 _DIRECT_TITLE = re.compile(r"<title[^>]*>.*?</title>", re.IGNORECASE | re.DOTALL)
+
+# Script tags: only the exact Tailwind CDN script the codegen itself
+# injects is authorized. Any other <script> — inline code, another
+# src, code inside the tag, or a missing close tag — is a refusal.
+# The patterns are case-insensitive and cover whitespace tricks
+# (<ScRiPt>, <script\tsrc=...>) and unquoted attribute values.
+_SCRIPT_OPEN = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
+_SCRIPT_CLOSE = re.compile(r"</script\s*>", re.IGNORECASE)
+_SCRIPT_SRC = re.compile(
+    r"""src\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
+    re.IGNORECASE)
+# Resource URLs: src, href, action, formaction (quoted or unquoted)
+# plus srcset (quoted; comma-separated "url [descriptor]" candidates).
+_RESOURCE_URL_ATTRS = re.compile(
+    r"""(?P<attr>src|href|action|formaction)\s*=\s*"""
+    r"""(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
+    re.IGNORECASE)
+_SRCSET_ATTR = re.compile(
+    r"""srcset\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""",
+    re.IGNORECASE)
+
+
+def _attr_value(match):
+    """The attribute value from a quoted-or-unquoted regex match.
+
+    All attribute regexes below use the same named groups (dq / sq /
+    bare), so this works for script src, resource URLs, and srcset.
+    """
+    for group in ("dq", "sq", "bare"):
+        value = match.group(group)
+        if value is not None:
+            return value
+    return ""
+
+
+def _check_resource_url(attr, url, violations):
+    """One resource URL against the gates. Appends (code, message)."""
+    url = (url or "").strip()
+    lowered = url.lower()
+    if lowered.startswith(("javascript:", "vbscript:")):
+        if attr == "href":
+            violations.append(("javascript-href",
+                               "javascript: link found in generated page"))
+        else:
+            violations.append(("unsafe-url-scheme",
+                               f"unsafe URL scheme in {attr} attribute: "
+                               f"{url}"))
+        return
+    if lowered.startswith("data:"):
+        violations.append(("unsafe-url-scheme",
+                           f"unsafe URL scheme in {attr} attribute: {url}"))
+        return
+    if url.startswith(("http://", "https://", "//")):
+        base = url.split("?", 1)[0].rstrip("/")
+        if base not in (TAILWIND_CDN,) and url != TAILWIND_CDN:
+            violations.append(("external-asset",
+                               "external URL is not allowlisted: "
+                               f"{url} — assets must be local files, "
+                               "never hotlinks"))
+
+
+def scan_direct_violations(html_doc: str) -> list:
+    """Static safety scan shared by generate_page_direct and check_html.
+
+    Returns a list of (code, message) for every violation found; an
+    empty list means the HTML passed the static gates. Covers inline
+    <script> blocks (only the exact Tailwind CDN script tag is
+    allowed), unsafe URL schemes (javascript:, vbscript:, data:), and
+    non-allowlisted external URLs in src, href, action, formaction,
+    and srcset. The scan never cleans anything: callers refuse on any
+    violation, with the named reason.
+    """
+    violations = []
+    text = html_doc or ""
+    # --- <script> tags ---
+    for open_match in _SCRIPT_OPEN.finditer(text):
+        tag = open_match.group(0)
+        src_match = _SCRIPT_SRC.search(tag)
+        src = _attr_value(src_match) if src_match else None
+        if src is None:
+            violations.append(("inline-script",
+                               "inline <script> block found — generated "
+                               "pages must not run inline scripts"))
+            continue
+        if src != TAILWIND_CDN:
+            violations.append(("unauthorized-script-src",
+                               "script source is not allowlisted: "
+                               f"{src} — only the Tailwind CDN script "
+                               "is allowed"))
+            continue
+        # Authorized src: the tag must be empty and closed. Code
+        # inside it, or a missing close tag, is still a refusal —
+        # an unclosed <script> would swallow the rest of the page.
+        close_match = _SCRIPT_CLOSE.search(text, open_match.end())
+        if close_match is None:
+            violations.append(("inline-script",
+                               "unclosed <script> tag found — generated "
+                               "pages must not run inline scripts"))
+            continue
+        if text[open_match.end():close_match.start()].strip():
+            violations.append(("inline-script",
+                               "inline code inside <script> tag found — "
+                               "generated pages must not run inline "
+                               "scripts"))
+    # --- resource URLs ---
+    for match in _RESOURCE_URL_ATTRS.finditer(text):
+        _check_resource_url(match.group("attr").lower(),
+                            _attr_value(match), violations)
+    for match in _SRCSET_ATTR.finditer(text):
+        for candidate in _attr_value(match).split(","):
+            parts = candidate.strip().split()
+            if parts:
+                _check_resource_url("srcset", parts[0], violations)
+    return violations
+
+
+def _check_direct_html(html_doc: str) -> None:
+    """Safety gates for model-written HTML. Raises ValueError on violation."""
+    _check_no_secrets(html_doc, "model-written page")
+    for _code, message in scan_direct_violations(html_doc):
+        raise ValueError(f"refusing model-written page: {message}")
+    if _DIRECT_EVENT_ATTR.search(html_doc):
+        raise ValueError(
+            "refusing model-written page: inline event handler "
+            "(onclick etc.) found — generated pages must not run "
+            "inline scripts")
 
 
 def extract_html(model_reply: str) -> str:
@@ -200,37 +327,19 @@ def extract_html(model_reply: str) -> str:
     return html_doc
 
 
-def _check_direct_html(html_doc: str) -> None:
-    """Safety gates for model-written HTML. Raises ValueError on violation."""
-    _check_no_secrets(html_doc, "model-written page")
-    if _DIRECT_JS_HREF.search(html_doc):
-        raise ValueError(
-            "refusing model-written page: javascript: link found")
-    if _DIRECT_EVENT_ATTR.search(html_doc):
-        raise ValueError(
-            "refusing model-written page: inline event handler "
-            "(onclick etc.) found — generated pages must not run "
-            "inline scripts")
-    for url in _DIRECT_URL_ATTRS.findall(html_doc):
-        if url.startswith(("http://", "https://", "//")):
-            base = url.split("?", 1)[0].rstrip("/")
-            if base not in (TAILWIND_CDN,) and url != TAILWIND_CDN:
-                raise ValueError(
-                    "refusing model-written page: external URL is not "
-                    f"allowlisted: {url} — assets must be local files, "
-                    "never hotlinks")
-
-
 def generate_page_direct(model_reply: str, title: str | None = None,
                          model: str = "gemini-4-hydrogen") -> GeneratedPage:
     """Build a page from the model's own HTML reply.
 
     Extracts the document, runs the safety gates (secret scan, no
+    inline <script> blocks, only the Tailwind CDN script source, no
     ``javascript:`` links, no inline handlers, no non-allowlisted
-    external URLs), injects the Tailwind CDN script and a ``<title>``
-    when the model left them out, and returns a GeneratedPage. The
-    result is still untrusted until ``check_html`` passes AND a live
-    render proves it — this function only proves the gates passed.
+    external URLs in src/href/action/formaction/srcset), injects the
+    Tailwind CDN script and a ``<title>`` when the model left them
+    out, then runs the gates again on the final output so only the
+    exact injected Tailwind tag survives. Returns a GeneratedPage.
+    The result is still untrusted until ``check_html`` passes AND a
+    live render proves it — this function only proves the gates passed.
     """
     html_doc = extract_html(model_reply)
     _check_direct_html(html_doc)
@@ -259,5 +368,8 @@ def generate_page_direct(model_reply: str, title: str | None = None,
         inner = re.sub(r"<[^>]+>", "", match.group(0)).strip()
         if inner:
             page_title = inner
+    # Final-output check: the gates run again after injection so the
+    # delivered page holds only the exact injected Tailwind tag.
+    _check_direct_html(html_doc)
     return GeneratedPage(html=html_doc, title=page_title,
                          cost_usd=0.0, model=model, rounds=0)

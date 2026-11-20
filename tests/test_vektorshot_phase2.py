@@ -1,4 +1,4 @@
-"""VektorShot Phase 2 tests — 20 tests, fake-only.
+"""VektorShot Phase 2 tests — 21 tests, fake-only.
 
 No live model calls, no keys, no network: the Gemini transport is
 mocked at urllib.request.urlopen, Playwright is never launched, and
