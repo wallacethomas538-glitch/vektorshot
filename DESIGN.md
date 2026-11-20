@@ -1,8 +1,12 @@
 # VektorShot — Design (name LOCKED Nov 19, Wallace: "I like the name")
 
-**Status:** design only. No code written. Build awaits Big Chat review +
-Wallace's tap (governance: Gemini builds, Mewsa verifies, Big Chat reviews,
-Wallace decides).
+**Status:** Phase 1 built, tested 20/20, live-tested on the real
+VektorFlow AI Systems space (Nov 19). **Phase 2 built Nov 19 (local
+only — not pushed, not merged, not deployed):** live Gemini vision,
+model-written HTML through the same safety gates, and a real
+render → compare → fix loop. The template path was too weak — Wallace:
+"That is not a website" — so Phase 2 is the model-driven path. Big
+Chat review of Phase 1 is still queued; Phase 2 review is owed too.
 
 ## Where the concept comes from
 
@@ -30,16 +34,34 @@ VektorBridge: Bridge pulls live data, Shot builds the page that shows it.
    path you point at. Phase 1 is screenshot files only.
 2. **Vision — free-tier-first cascade.** VektorCode's existing routing
    (Gemini Hydrogen / Groq vision / local Ollama vision) reads the picture:
-   layout, text, colors, components.
-3. **Generation — HTML + Tailwind first.** One stack, done well, in
-   VektorFlow's design system by default (dark theme, cyan accent, brand V).
-4. **Self-check — Playwright.** Already our chosen browser tool (Nov 18).
-   Render the page headless, screenshot it, vision-compare against the
-   original, fix mismatches. Up to N rounds, then hand over what it has with
-   an honest report.
+   layout, text, colors, components. **Phase 2 wires Gemini live:**
+   `GeminiVisionProvider` calls the native endpoint (Hydrogen, key from
+   `GEMINI_API_KEY` only), downscales screenshots to ~512px first (big
+   images 503/hang — proven Nov 19), 180s timeout, honest errors on
+   missing key / 503 / timeout. Groq and Ollama live calls are not
+   wired yet.
+3. **Generation — model-written HTML first, template as fallback.**
+   Phase 1's `generate_page()` fills a fixed template from a structured
+   layout — safe, but the rebuild looks like a sketch, not the site.
+   **Phase 2's `generate_page_direct()` takes the model's own HTML**
+   and runs it through the same safety gates (secret scan, no
+   `javascript:` links, no inline handlers, no non-allowlisted external
+   URLs — Tailwind CDN only), injecting the Tailwind script and a
+   `<title>` when the model leaves them out. HTML + Tailwind, in
+   VektorFlow's design system by default (dark theme, cyan accent,
+   brand V).
+4. **Self-check — Playwright, wired for real.** Already our chosen browser tool (Nov 18).
+   Render the page headless, screenshot it, compare it to the original
+   (PIL pixel diff, or an honestly-labeled weak byte-length fallback
+   when PIL is absent), ask the vision model for concrete visible
+   differences, and re-prompt it with that list. Up to 3 rounds, then
+   hand over what it has with an honest report. `render()` takes an
+   optional `executable_path` for Chromium (the installed Playwright
+   wants headless-shell 1255; the cache holds Chromium 1248).
 5. **Verification — TEST-FIRST.** The page must render with no console
    errors and no broken asset references before it is handed over. Screenshot
-   proof attached.
+   proof attached. Model-written HTML is untrusted until `check_html`
+   passes AND a live render proves it.
 6. **Skill — a VektorCode skill.** The code lands in the repo you are already
    working on. No second app to deploy, no second backend to keep alive.
 
@@ -75,17 +97,26 @@ This is what makes it ours, not a copy with our name on it:
 - **Phase 0:** Big Chat reviews this design. First verify the free vision
   inputs with a small probe before any build: Hydrogen image input, a Groq
   vision model, local Ollama vision. If a route can't see pictures, it is
-  out — no guessing.
+  out — no guessing. (Done Nov 19: Hydrogen reads images; big images
+  503/hang, downscale first.)
 - **Phase 1:** Screenshot → HTML + Tailwind, Playwright self-check, skill
-  wiring into VektorCode.
-- **Phase 2:** React + Tailwind; asset extraction (real logos/images out of
-  the shot, saved locally).
-- **Phase 3:** Figma import; video → prototype.
+  wiring into VektorCode. **DONE Nov 19** (20 tests, repo live) — but the
+  template rebuild was too weak to call a website.
+- **Phase 2:** Live Gemini vision + model-written HTML + real
+  compare-and-fix loop. **BUILT Nov 19 (local only, 40 tests passing).**
+  This replaces the old Phase 2 plan below — Wallace ordered the
+  better-websites fix first, and it is what the live test proved we
+  needed.
+- **Phase 3 (was Phase 2):** React + Tailwind; asset extraction (real
+  logos/images out of the shot, saved locally).
+- **Phase 4 (was Phase 3):** Figma import; video → prototype.
 
 ## Open decisions (Wallace)
 
 - Final name — **LOCKED Nov 19: VektorShot** (Wallace: "I like the name").
-- First UI to prove it on — a store product page? the command center?
+- First UI to prove it on — **DECIDED + TESTED Nov 19:** the VektorFlow
+  AI Systems space. Template rebuild proved too weak; Phase 2 re-test
+  on the same UI is owed.
 - Free-only vision, or allow buyer-supplied paid keys as an option.
 
 ## Limits, stated up front
@@ -94,4 +125,7 @@ This is what makes it ours, not a copy with our name on it:
   outputs will be rougher; the self-check loop closes much of the gap.
 - Screenshot-only in Phase 1; Figma and video come later.
 - Generated code is untrusted until it renders clean and passes the checks.
+  Model-written HTML is doubly untrusted: it passes the safety gates
+  first, then `check_html`, then a live render. The compare score is a
+  guide, not proof — a page can score high and still read wrong.
 - Only build UIs from pictures you have the right to use.

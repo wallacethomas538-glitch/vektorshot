@@ -14,6 +14,8 @@ __all__ = [
     "ScreenshotInput",
     "GeneratedPage",
     "SelfCheckResult",
+    "CompareResult",
+    "SelfCheckRun",
     "VerificationIssue",
     "VerificationReport",
     "CostLedger",
@@ -115,6 +117,38 @@ class SelfCheckResult:
             raise ValueError(f"unknown verdict: {self.verdict!r}")
         if not 0.0 <= self.similarity <= 1.0:
             raise ValueError("similarity must be between 0.0 and 1.0")
+
+
+@dataclass
+class CompareResult:
+    """How alike two screenshots are.
+
+    ``method`` says how the number was produced. ``weak`` is True for
+    the stdlib byte-length fallback: it only proves the files are
+    about the same size, never that the pages look alike. A weak score
+    is a guide, not proof — never present it as a visual match.
+    """
+
+    similarity: float = 0.0
+    method: str = "pil-pixel-diff"
+    weak: bool = False
+
+    def __post_init__(self):
+        if not 0.0 <= self.similarity <= 1.0:
+            raise ValueError("similarity must be between 0.0 and 1.0")
+
+
+@dataclass
+class SelfCheckRun:
+    """The outcome of a whole render -> compare -> fix loop."""
+
+    history: list = field(default_factory=list)
+    html: str = ""
+    html_path: str = ""
+    accepted: bool = False
+    # Honest footnotes: weak scores, failed renders, failed fixes.
+    # Callers report these alongside the history, never silently.
+    notes: list = field(default_factory=list)
 
 
 @dataclass

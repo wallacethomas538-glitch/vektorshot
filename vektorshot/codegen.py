@@ -1,7 +1,14 @@
-"""HTML + Tailwind code generation for VektorShot Phase 1.
+"""HTML + Tailwind code generation for VektorShot.
 
-Stdlib only. Takes a LayoutDescription and writes one self-contained
+Phase 1 (template path): a LayoutDescription becomes one self-contained
 HTML page in the VektorFlow design system (dark theme, cyan accent).
+
+Phase 2 (direct path): the vision model writes the HTML itself and
+``generate_page_direct`` puts it through the same safety gates —
+secret scan, no ``javascript:`` links, no inline event handlers, no
+non-allowlisted external URLs (Tailwind CDN only). The template path
+is unchanged; the direct path is what makes a rebuild look like the
+original instead of a generic sketch.
 
 Safety rules, enforced here:
 - All text from the layout is HTML-escaped.
@@ -20,7 +27,8 @@ import re
 
 from .models import BRAND, GeneratedPage, LayoutDescription
 
-__all__ = ["generate_page", "SECRET_PATTERNS"]
+__all__ = ["generate_page", "generate_page_direct", "extract_html",
+           "SECRET_PATTERNS"]
 
 # Patterns that must never appear in generated code. The same list is
 # used by verify.py; keep them in sync.
@@ -140,4 +148,116 @@ def generate_page(layout, title=None, model="stub"):
 </html>
 """
     return GeneratedPage(html=body_html, title=page_title,
+                         cost_usd=0.0, model=model, rounds=0)
+
+
+# --- Phase 2: model-driven generation --------------------------------
+
+# The direct path mirrors these checks from verify.py (which imports
+# SECRET_PATTERNS and TAILWIND_CDN from here, so the patterns stay in
+# sync by construction). A model-written page is untrusted input: it
+# goes through the same gates the template path enforces, and anything
+# that fails is refused — never silently cleaned up.
+_DIRECT_URL_ATTRS = re.compile(
+    r'''(?:src|href)\s*=\s*["']([^"']+)["']''', re.IGNORECASE)
+_DIRECT_JS_HREF = re.compile(
+    r'''href\s*=\s*["']\s*javascript:''', re.IGNORECASE)
+_DIRECT_EVENT_ATTR = re.compile(r'''\son\w+\s*=''', re.IGNORECASE)
+_DIRECT_TITLE = re.compile(r"<title[^>]*>.*?</title>", re.IGNORECASE | re.DOTALL)
+
+
+def extract_html(model_reply: str) -> str:
+    """Pull the HTML document out of a model's raw reply.
+
+    Strips markdown fences and surrounding prose, keeps the slice from
+    the first ``<!DOCTYPE html>`` (or ``<html``) to the last
+    ``</html>``. A missing doctype is added; a reply with no ``<html``
+    tag at all raises ValueError — there is nothing to build from.
+    """
+    if not isinstance(model_reply, str) or not model_reply.strip():
+        raise ValueError("model reply is empty: no HTML to extract")
+    text = model_reply
+    lines = [line for line in text.splitlines()
+             if not line.strip().startswith("```")]
+    text = "\n".join(lines)
+    lowered = text.lower()
+    start = lowered.find("<!doctype html")
+    if start < 0:
+        start = lowered.find("<html")
+    if start < 0:
+        raise ValueError(
+            "model reply contained no HTML document "
+            "(no <html> tag found) — re-prompt the model, do not guess "
+            "a page.")
+    end = lowered.rfind("</html>")
+    if end < 0:
+        raise ValueError(
+            "model reply has an opening <html> tag but no closing "
+            "</html> — the reply looks truncated; re-prompt the model.")
+    html_doc = text[start:end + len("</html>")].strip()
+    if not html_doc.lower().startswith("<!doctype html"):
+        html_doc = "<!DOCTYPE html>\n" + html_doc
+    return html_doc
+
+
+def _check_direct_html(html_doc: str) -> None:
+    """Safety gates for model-written HTML. Raises ValueError on violation."""
+    _check_no_secrets(html_doc, "model-written page")
+    if _DIRECT_JS_HREF.search(html_doc):
+        raise ValueError(
+            "refusing model-written page: javascript: link found")
+    if _DIRECT_EVENT_ATTR.search(html_doc):
+        raise ValueError(
+            "refusing model-written page: inline event handler "
+            "(onclick etc.) found — generated pages must not run "
+            "inline scripts")
+    for url in _DIRECT_URL_ATTRS.findall(html_doc):
+        if url.startswith(("http://", "https://", "//")):
+            base = url.split("?", 1)[0].rstrip("/")
+            if base not in (TAILWIND_CDN,) and url != TAILWIND_CDN:
+                raise ValueError(
+                    "refusing model-written page: external URL is not "
+                    f"allowlisted: {url} — assets must be local files, "
+                    "never hotlinks")
+
+
+def generate_page_direct(model_reply: str, title: str | None = None,
+                         model: str = "gemini-4-hydrogen") -> GeneratedPage:
+    """Build a page from the model's own HTML reply.
+
+    Extracts the document, runs the safety gates (secret scan, no
+    ``javascript:`` links, no inline handlers, no non-allowlisted
+    external URLs), injects the Tailwind CDN script and a ``<title>``
+    when the model left them out, and returns a GeneratedPage. The
+    result is still untrusted until ``check_html`` passes AND a live
+    render proves it — this function only proves the gates passed.
+    """
+    html_doc = extract_html(model_reply)
+    _check_direct_html(html_doc)
+    if TAILWIND_CDN not in html_doc:
+        script = f'<script src="{TAILWIND_CDN}"></script>'
+        lowered = html_doc.lower()
+        head_end = lowered.find("</head>")
+        if head_end >= 0:
+            html_doc = (html_doc[:head_end] + script + "\n"
+                        + html_doc[head_end:])
+        else:
+            html_doc = script + "\n" + html_doc
+    page_title = title or "VektorShot page"
+    if not _DIRECT_TITLE.search(html_doc):
+        title_tag = f"<title>{_esc(page_title)}</title>"
+        lowered = html_doc.lower()
+        head_start = lowered.find("<head")
+        if head_start >= 0:
+            head_close = html_doc.find(">", head_start)
+            html_doc = (html_doc[:head_close + 1] + "\n" + title_tag
+                        + html_doc[head_close + 1:])
+        else:
+            html_doc = title_tag + "\n" + html_doc
+    else:
+        match = _DIRECT_TITLE.search(html_doc)
+        inner = re.sub(r"<[^>]+>", "", match.group(0)).strip()
+        if inner:
+            page_title = inner
+    return GeneratedPage(html=html_doc, title=page_title,
                          cost_usd=0.0, model=model, rounds=0)

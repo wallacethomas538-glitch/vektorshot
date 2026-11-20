@@ -1,13 +1,21 @@
-"""Self-check loop for VektorShot Phase 1.
+"""Self-check loop for VektorShot.
 
 Render the generated page headless, screenshot it, compare it against
 the original screenshot, and fix what does not match — up to N rounds,
 then hand over what exists with an honest report.
 
-Phase 1 provides the command builder and the pure loop logic. The
-render step runs only when Playwright and a browser are actually
-available; in this environment there is no live browser, so render()
-fails cleanly with a clear error instead of pretending.
+Phase 1 provided the command builder and the pure decide logic.
+Phase 2 wires the loop for real:
+
+- ``render`` accepts an optional ``executable_path`` for Chromium
+  (the pip-installed Playwright wants headless-shell 1255 while the
+  cache holds Chromium 1248 — pass that binary's path when needed).
+- ``compare_images`` scores two screenshots with a PIL pixel diff,
+  or an honestly-labeled weak byte-length fallback when PIL is absent.
+- ``compare_with_vision`` asks the vision model to list concrete
+  visible differences between the original and the rebuild.
+- ``run_self_check`` runs render -> compare -> fix (re-prompt the
+  model with the difference list) for up to 3 rounds.
 """
 
 from __future__ import annotations
@@ -16,7 +24,9 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .models import SelfCheckResult
+from .codegen import generate_page_direct
+from .models import CompareResult, SelfCheckResult, SelfCheckRun
+from .vision import FIX_PROMPT, VisionError
 
 __all__ = [
     "SelfCheckError",
@@ -24,6 +34,9 @@ __all__ = [
     "build_screenshot_command",
     "SelfCheckLoop",
     "render",
+    "compare_images",
+    "compare_with_vision",
+    "run_self_check",
 ]
 
 DEFAULT_MAX_ROUNDS = 3
@@ -121,15 +134,25 @@ class SelfCheckLoop:
 
 
 def render(target, output_png, width=1280, height=800, full_page=False,
-           timeout_s=30):
+           timeout_s=30, executable_path=None):
     """Screenshot a rendered page. Returns the output path.
 
     Raises SelfCheckError when Playwright is not installed or no
-    browser can be launched — never a bare traceback.
+    browser can be launched — never a bare traceback. Pass
+    ``executable_path`` when the Playwright-managed browser is not
+    the one to use (e.g. the cache holds Chromium 1248 while the
+    installed Playwright expects headless-shell 1255).
     """
     target = validate_target(target)
     out = Path(output_png)
     command = build_screenshot_command(target, out, width, height, full_page)
+    # Playwright's goto needs a URL: a local file path becomes file://.
+    # (The CLI command above takes a plain path; only goto needs this.)
+    parsed = urlparse(target)
+    if parsed.scheme in ("http", "https"):
+        goto_target = target
+    else:
+        goto_target = Path(target).resolve().as_uri()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -140,17 +163,24 @@ def render(target, output_png, width=1280, height=800, full_page=False,
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         with sync_playwright() as playwright:
+            launch_kwargs = {"headless": True}
+            if executable_path:
+                launch_kwargs["executable_path"] = str(executable_path)
             try:
-                browser = playwright.chromium.launch(headless=True)
+                browser = playwright.chromium.launch(**launch_kwargs)
             except Exception as exc:
+                hint = ""
+                if "Executable doesn't exist" in str(exc):
+                    hint = (" Pass executable_path to render() with the "
+                            "Chromium binary to use.")
                 raise SelfCheckError(
                     f"Could not launch Chromium: {exc}. Rendering needs "
                     "a working browser; run where one exists (local "
-                    "Termux or Daytona).") from None
+                    f"Termux or Daytona).{hint}") from None
             try:
                 page = browser.new_page(viewport={"width": width,
                                                   "height": height})
-                page.goto(target, timeout=timeout_s * 1000)
+                page.goto(goto_target, timeout=timeout_s * 1000)
                 page.wait_for_timeout(1000)
                 page.screenshot(path=str(out), full_page=full_page)
             finally:
@@ -160,3 +190,175 @@ def render(target, output_png, width=1280, height=800, full_page=False,
     except Exception as exc:
         raise SelfCheckError(f"Render failed: {exc}") from None
     return out
+
+
+def _read_png_bytes(source) -> bytes:
+    """Accept PNG bytes or a path to a PNG file. Anything else errors."""
+    if isinstance(source, (bytes, bytearray)):
+        data = bytes(source)
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise ValueError(
+                f"screenshot not found: {source!r}")
+        data = path.read_bytes()
+    if not data.startswith(b"\x89PNG"):
+        raise ValueError("screenshot must be a PNG image")
+    return data
+
+
+def compare_images(original, render) -> CompareResult:
+    """Score how alike two screenshots are, 0.0-1.0.
+
+    With Pillow: both images are resized to 128x128 thumbnails and
+    the mean per-channel pixel difference becomes the score. That is
+    a guide, not proof — a page can score high and still read wrong.
+
+    Without Pillow: the stdlib fallback compares byte lengths only.
+    It is honestly labeled weak (``weak=True``): two different pages
+    of similar size score high. Never present a weak score as a
+    visual match.
+    """
+    original_bytes = _read_png_bytes(original)
+    render_bytes = _read_png_bytes(render)
+    try:
+        from PIL import Image
+    except ImportError:
+        if not original_bytes or not render_bytes:
+            return CompareResult(similarity=0.0, method="byte-length",
+                                 weak=True)
+        similarity = (min(len(original_bytes), len(render_bytes))
+                      / max(len(original_bytes), len(render_bytes)))
+        return CompareResult(similarity=round(similarity, 4),
+                             method="byte-length", weak=True)
+    import io
+    with io.BytesIO(original_bytes) as buf:
+        original_image = Image.open(buf).convert("RGB")
+        original_image.load()
+    with io.BytesIO(render_bytes) as buf:
+        render_image = Image.open(buf).convert("RGB")
+        render_image.load()
+    size = (128, 128)
+    original_small = original_image.resize(size, Image.LANCZOS)
+    render_small = render_image.resize(size, Image.LANCZOS)
+    original_pixels = list(original_small.getdata())
+    render_pixels = list(render_small.getdata())
+    total = 0
+    for (r1, g1, b1), (r2, g2, b2) in zip(original_pixels, render_pixels):
+        total += abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
+    mean_diff = total / (len(original_pixels) * 3)
+    similarity = max(0.0, min(1.0, 1.0 - mean_diff / 255.0))
+    return CompareResult(similarity=round(similarity, 4),
+                         method="pil-pixel-diff", weak=False)
+
+
+def compare_with_vision(original, render, vision) -> list:
+    """Ask the vision model to list visible differences (original vs rebuild).
+
+    Returns a list of difference strings; an exact match is []. Raises
+    SelfCheckError when the provider cannot compare images or the
+    comparison call itself fails.
+    """
+    original_bytes = _read_png_bytes(original)
+    render_bytes = _read_png_bytes(render)
+    compare = getattr(vision, "compare_screenshots", None)
+    if compare is None:
+        raise SelfCheckError(
+            "this vision provider cannot compare two screenshots: it "
+            "has no compare_screenshots method")
+    try:
+        differences = compare(original_bytes, render_bytes)
+    except VisionError as exc:
+        raise SelfCheckError(f"vision comparison failed: {exc}") from None
+    if not isinstance(differences, list):
+        raise SelfCheckError(
+            "vision comparison returned something that is not a list "
+            "of differences")
+    return [str(d) for d in differences if str(d).strip()]
+
+
+def run_self_check(original_png, initial_html, vision, workdir,
+                   loop=None, width=1280, height=800,
+                   render_fn=None, compare_fn=None) -> SelfCheckRun:
+    """Run render -> compare -> fix for up to ``loop.max_rounds`` rounds.
+
+    - ``original_png``: the original screenshot (PNG bytes or path).
+    - ``initial_html``: already-gated HTML (from ``generate_page`` or
+      ``generate_page_direct``).
+    - ``vision``: provider with ``generate_html(image_bytes, prompt)``
+      and ``compare_screenshots(original, render)`` (Gemini in
+      Phase 2; fakes in tests).
+    - ``workdir``: directory for round-*.html / round-*.png files.
+    - ``render_fn`` / ``compare_fn``: injectable seams for tests;
+      default to ``render`` and ``compare_images``.
+
+    Returns a SelfCheckRun: the round history, the final HTML, its
+    path, and whether any round was accepted. A page is accepted only
+    when a round's similarity reaches the threshold; anything else is
+    handed over as-is with the history saying so.
+    """
+    loop = loop or SelfCheckLoop()
+    original_bytes = _read_png_bytes(original_png)
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    render_fn = render_fn or render
+    compare_fn = compare_fn or compare_images
+
+    history = []
+    notes = []
+    current_html = initial_html
+    html_path = workdir / "round-0.html"
+    html_path.write_text(current_html, encoding="utf-8")
+    accepted = False
+
+    for round_no in range(1, loop.max_rounds + 1):
+        html_path = workdir / f"round-{round_no}.html"
+        html_path.write_text(current_html, encoding="utf-8")
+        render_path = workdir / f"round-{round_no}.png"
+        try:
+            render_fn(str(html_path), str(render_path), width, height)
+        except SelfCheckError as exc:
+            notes.append(f"round {round_no}: render failed: {exc}")
+            break
+        render_bytes = render_path.read_bytes()
+        compared = compare_fn(original_bytes, render_bytes)
+        try:
+            differences = compare_with_vision(
+                original_bytes, render_bytes, vision)
+        except SelfCheckError as exc:
+            result = loop.record(round_no, compared.similarity,
+                                 issues=[str(exc)])
+            history.append(result)
+            notes.append(f"round {round_no}: {exc}; cannot fix "
+                         "without a difference list")
+            break
+        result = loop.record(round_no, compared.similarity,
+                             issues=differences)
+        history.append(result)
+        if compared.weak:
+            notes.append(
+                f"round {round_no}: similarity {compared.similarity:.2f} "
+                f"is a weak {compared.method} score, not a visual match")
+        if result.verdict == "accept":
+            accepted = True
+            break
+        if result.verdict == "give_up":
+            break
+        # verdict == "fix": re-prompt the model with the difference list.
+        fix_prompt = FIX_PROMPT.format(
+            differences="\n".join(f"- {d}" for d in differences)
+            or "- (no specific differences listed)",
+            current_html=current_html)
+        try:
+            reply = vision.generate_html(original_bytes, fix_prompt)
+            fixed = generate_page_direct(reply, model="gemini-4-hydrogen")
+        except (VisionError, ValueError) as exc:
+            notes.append(f"round {round_no}: fix failed: {exc}")
+            break
+        current_html = fixed.html
+        html_path = workdir / f"round-{round_no}-fixed.html"
+        html_path.write_text(current_html, encoding="utf-8")
+
+    return SelfCheckRun(history=history, html=current_html,
+                        html_path=str(html_path), accepted=accepted,
+                        notes=notes)
