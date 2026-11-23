@@ -1,9 +1,10 @@
 """Static verification for generated pages.
 
 Checks what can be checked without a browser: document structure,
-<script> tags, external asset URLs (src, href, action, formaction,
-srcset), and secrets. Console errors and real rendering can only be
-proven by a live browser run, so every report says so:
+<script> tags, inline event handlers, external asset URLs (src, href,
+action, formaction, srcset), CSS url(), meta-refresh URLs, and
+secrets. Console errors and real rendering can only be proven by a
+live browser run, so every report says so:
 ``requires_live_render`` is always True until a render proves otherwise.
 """
 
@@ -23,8 +24,6 @@ __all__ = [
 # The only external URL a generated page may reference. Everything else
 # (images, fonts, scripts) must be a local file, never a hotlink.
 EXTERNAL_ALLOWLIST = {TAILWIND_CDN}
-
-_EVENT_ATTR = re.compile(r'''\son\w+\s*=''', re.IGNORECASE)
 
 
 def scan_for_tokens(text, tokens):
@@ -53,16 +52,11 @@ def check_html(html):
                 code=code,
                 message=f"generated page is missing {tag}"))
 
-    # Script tags + resource URLs: the same scan generate_page_direct
-    # refuses on, so both gates reject the same unsafe HTML.
+    # Script tags, event handlers, resource URLs, CSS url(), and
+    # meta-refresh URLs: the same scan generate_page_direct refuses
+    # on, so both gates reject the same unsafe HTML.
     for code, message in scan_direct_violations(html):
         issues.append(VerificationIssue(code=code, message=message))
-
-    if _EVENT_ATTR.search(html):
-        issues.append(VerificationIssue(
-            code="inline-handler",
-            message="inline event handler (onclick etc.) found — "
-                    "generated pages must not run inline scripts"))
 
     for pattern in SECRET_PATTERNS:
         match = pattern.search(html)

@@ -9,9 +9,13 @@ secret scan, no ``javascript:`` links, no inline event handlers, no
 non-allowlisted external URLs (Tailwind CDN only), no inline
 ``<script>`` blocks (only the exact Tailwind CDN script tag is
 allowed), and validated resource URLs in ``src``, ``href``,
-``action``, ``formaction``, and ``srcset``. The template path is
-unchanged; the direct path is what makes a rebuild look like the
-original instead of a generic sketch.
+``action``, ``formaction``, and ``srcset`` (quoted or unquoted),
+CSS ``url()``, and meta-refresh URLs. Attribute values are checked
+after HTML character references are decoded once, so encoded
+spellings such as "jav&#x61;script:" are caught; tag names are not
+decoded, because browsers do not decode them either. The template
+path is unchanged; the direct path is what makes a rebuild look like
+the original instead of a generic sketch.
 
 Safety rules, enforced here:
 - All text from the layout is HTML-escaped.
@@ -163,7 +167,19 @@ def generate_page(layout, title=None, model="stub"):
 # construction). A model-written page is untrusted input: it goes
 # through the same gates the template path enforces, and anything
 # that fails is refused — never silently cleaned up.
-_DIRECT_EVENT_ATTR = re.compile(r'''\son\w+\s*=''', re.IGNORECASE)
+#
+# Browsers decode HTML character references in attribute values, so
+# the attribute-level checks run on a decoded copy of the document:
+# "jav&#x61;script:" is javascript: to a browser, and "&#32;" is a
+# space. Tag names are NOT decoded by browsers, so the <script>
+# checks run on the raw text: "<scr&#x69;pt>" is a bogus tag, not a
+# script tag. URL values are also stripped of C0 controls and spaces
+# before the scheme check (browsers drop tab/LF/CR from URLs and
+# strip leading controls), so "java&Tab;script:" is caught too.
+# Decoding happens exactly once: "&amp;#106;avascript:" decodes to
+# the literal text "&#106;avascript:", which is a harmless relative
+# URL to a browser, so it must not be refused.
+_DIRECT_EVENT_ATTR = re.compile(r"""[\s"'/]on\w+\s*=""", re.IGNORECASE)
 _DIRECT_TITLE = re.compile(r"<title[^>]*>.*?</title>", re.IGNORECASE | re.DOTALL)
 
 # Script tags: only the exact Tailwind CDN script the codegen itself
@@ -177,14 +193,46 @@ _SCRIPT_SRC = re.compile(
     r"""src\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
     re.IGNORECASE)
 # Resource URLs: src, href, action, formaction (quoted or unquoted)
-# plus srcset (quoted; comma-separated "url [descriptor]" candidates).
+# plus srcset (quoted or unquoted; comma-separated "url [descriptor]"
+# candidates).
 _RESOURCE_URL_ATTRS = re.compile(
     r"""(?P<attr>src|href|action|formaction)\s*=\s*"""
     r"""(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
     re.IGNORECASE)
 _SRCSET_ATTR = re.compile(
-    r"""srcset\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""",
+    r"""srcset\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
     re.IGNORECASE)
+
+# CSS url(...) in style attributes and <style> blocks: quoted,
+# single-quoted, or unquoted. The unquoted form stops at the first
+# ")", so "url(javascript:alert(1))" captures "javascript:alert(1"
+# — still enough for the scheme check to refuse it.
+_CSS_URL = re.compile(
+    r"""url\s*\(\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^)]*?))\s*\)""",
+    re.IGNORECASE)
+
+# <meta http-equiv="refresh" content="0;url=...">: http-equiv and
+# content may each be quoted or unquoted; the url inside content may
+# be quoted or bare.
+_META_TAG = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_HTTP_EQUIV_ATTR = re.compile(
+    r"""http-equiv\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
+    re.IGNORECASE)
+_META_CONTENT_ATTR = re.compile(
+    r"""content\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
+    re.IGNORECASE)
+_META_REFRESH_URL = re.compile(
+    r"""url\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^;]*))""",
+    re.IGNORECASE)
+
+# Quoted / bare attribute values, used to blank values out of the
+# handler view (below): a handler name must be found in tag markup,
+# never inside a value such as href=".../onload=1" or a title that
+# merely mentions "onload=".
+_DQ_VALUE = re.compile(r'"[^"]*"')
+_SQ_VALUE = re.compile(r"'[^']*'")
+_BARE_VALUE = re.compile(r"=\s*[^\"'\s>]+")
+_URL_CONTROLS = re.compile(r"[\x00-\x20]")
 
 
 def _attr_value(match):
@@ -201,8 +249,14 @@ def _attr_value(match):
 
 
 def _check_resource_url(attr, url, violations):
-    """One resource URL against the gates. Appends (code, message)."""
-    url = (url or "").strip()
+    """One resource URL against the gates. Appends (code, message).
+
+    The URL arrives already entity-decoded (attribute checks run on
+    the decoded copy). C0 controls and spaces are stripped before
+    the scheme check, matching how browsers treat them in URLs
+    (tab/LF/CR are dropped; leading controls/spaces are stripped).
+    """
+    url = _URL_CONTROLS.sub("", (url or "").strip())
     lowered = url.lower()
     if lowered.startswith(("javascript:", "vbscript:")):
         if attr == "href":
@@ -210,12 +264,12 @@ def _check_resource_url(attr, url, violations):
                                "javascript: link found in generated page"))
         else:
             violations.append(("unsafe-url-scheme",
-                               f"unsafe URL scheme in {attr} attribute: "
+                               f"unsafe URL scheme in {attr}: "
                                f"{url}"))
         return
     if lowered.startswith("data:"):
         violations.append(("unsafe-url-scheme",
-                           f"unsafe URL scheme in {attr} attribute: {url}"))
+                           f"unsafe URL scheme in {attr}: {url}"))
         return
     if url.startswith(("http://", "https://", "//")):
         base = url.split("?", 1)[0].rstrip("/")
@@ -226,20 +280,44 @@ def _check_resource_url(attr, url, violations):
                                "never hotlinks"))
 
 
+def _handler_view(decoded: str) -> str:
+    """The decoded document with attribute values blanked out.
+
+    A handler attribute (onerror, onload, ...) is a name in tag
+    markup; the text inside a value can never be one. Blanking values
+    keeps the check from firing on a URL or title that merely
+    mentions one ("pages/onload=1.html", title="click onload=now").
+    Quoted values collapse to empty quotes so the quote that
+    separated them from the next attribute stays a separator:
+    src="x"onerror=... still reads as `"onerror=` after blanking.
+    Bare values are blanked only when they start with a non-quote
+    character, so the empty quotes left by the first pass are kept.
+    """
+    view = _DQ_VALUE.sub('""', decoded)
+    view = _SQ_VALUE.sub("''", view)
+    view = _BARE_VALUE.sub("=", view)
+    return view
+
+
 def scan_direct_violations(html_doc: str) -> list:
     """Static safety scan shared by generate_page_direct and check_html.
 
     Returns a list of (code, message) for every violation found; an
     empty list means the HTML passed the static gates. Covers inline
     <script> blocks (only the exact Tailwind CDN script tag is
-    allowed), unsafe URL schemes (javascript:, vbscript:, data:), and
-    non-allowlisted external URLs in src, href, action, formaction,
-    and srcset. The scan never cleans anything: callers refuse on any
-    violation, with the named reason.
+    allowed), inline event handlers (on* attributes — the separator
+    before one may be whitespace, a quote, or a slash, and may itself
+    be entity-encoded), unsafe URL schemes (javascript:, vbscript:,
+    data:, including entity-encoded or control-character-padded
+    spellings), and non-allowlisted external URLs in src, href,
+    action, formaction, srcset (quoted or unquoted), CSS url(), and
+    meta-refresh URLs. The scan never cleans anything: callers refuse
+    on any violation, with the named reason.
     """
     violations = []
     text = html_doc or ""
-    # --- <script> tags ---
+    # Tag names are not decoded by browsers, so the <script> checks
+    # run on the raw text.
     for open_match in _SCRIPT_OPEN.finditer(text):
         tag = open_match.group(0)
         src_match = _SCRIPT_SRC.search(tag)
@@ -269,15 +347,43 @@ def scan_direct_violations(html_doc: str) -> list:
                                "inline code inside <script> tag found — "
                                "generated pages must not run inline "
                                "scripts"))
+    # Everything below is an attribute value, which browsers decode:
+    # run it on the entity-decoded copy.
+    decoded = html.unescape(text)
+    # --- inline event handlers ---
+    if _DIRECT_EVENT_ATTR.search(_handler_view(decoded)):
+        violations.append(("inline-handler",
+                           "inline event handler (onclick etc.) found — "
+                           "generated pages must not run inline scripts"))
     # --- resource URLs ---
-    for match in _RESOURCE_URL_ATTRS.finditer(text):
+    for match in _RESOURCE_URL_ATTRS.finditer(decoded):
         _check_resource_url(match.group("attr").lower(),
                             _attr_value(match), violations)
-    for match in _SRCSET_ATTR.finditer(text):
+    for match in _SRCSET_ATTR.finditer(decoded):
         for candidate in _attr_value(match).split(","):
             parts = candidate.strip().split()
             if parts:
                 _check_resource_url("srcset", parts[0], violations)
+    # --- CSS url(...) in style attributes and <style> blocks ---
+    for match in _CSS_URL.finditer(decoded):
+        _check_resource_url("css url()", _attr_value(match), violations)
+    # --- <meta http-equiv="refresh" content="0;url=..."> ---
+    for tag_match in _META_TAG.finditer(decoded):
+        tag = tag_match.group(0)
+        equiv_match = _HTTP_EQUIV_ATTR.search(tag)
+        if equiv_match is None:
+            continue
+        if _attr_value(equiv_match).strip().lower() != "refresh":
+            continue
+        content_match = _META_CONTENT_ATTR.search(tag)
+        if content_match is None:
+            continue
+        url_match = _META_REFRESH_URL.search(
+            _attr_value(content_match))
+        if url_match is None:
+            continue
+        _check_resource_url("meta refresh", _attr_value(url_match),
+                            violations)
     return violations
 
 
@@ -286,11 +392,6 @@ def _check_direct_html(html_doc: str) -> None:
     _check_no_secrets(html_doc, "model-written page")
     for _code, message in scan_direct_violations(html_doc):
         raise ValueError(f"refusing model-written page: {message}")
-    if _DIRECT_EVENT_ATTR.search(html_doc):
-        raise ValueError(
-            "refusing model-written page: inline event handler "
-            "(onclick etc.) found — generated pages must not run "
-            "inline scripts")
 
 
 def extract_html(model_reply: str) -> str:
@@ -334,7 +435,9 @@ def generate_page_direct(model_reply: str, title: str | None = None,
     Extracts the document, runs the safety gates (secret scan, no
     inline <script> blocks, only the Tailwind CDN script source, no
     ``javascript:`` links, no inline handlers, no non-allowlisted
-    external URLs in src/href/action/formaction/srcset), injects the
+    external URLs in src/href/action/formaction/srcset, CSS url(),
+    or meta-refresh URLs — with entity-encoded and control-padded
+    spellings decoded before checking), injects the
     Tailwind CDN script and a ``<title>`` when the model left them
     out, then runs the gates again on the final output so only the
     exact injected Tailwind tag survives. Returns a GeneratedPage.
