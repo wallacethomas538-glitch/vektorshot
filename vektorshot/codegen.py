@@ -10,12 +10,16 @@ non-allowlisted external URLs (Tailwind CDN only), no inline
 ``<script>`` blocks (only the exact Tailwind CDN script tag is
 allowed), and validated resource URLs in ``src``, ``href``,
 ``action``, ``formaction``, and ``srcset`` (quoted or unquoted),
-CSS ``url()``, and meta-refresh URLs. Attribute values are checked
-after HTML character references are decoded once, so encoded
-spellings such as "jav&#x61;script:" are caught; tag names are not
-decoded, because browsers do not decode them either. The template
-path is unchanged; the direct path is what makes a rebuild look like
-the original instead of a generic sketch.
+CSS ``url()``, CSS ``@import``, and meta-refresh URLs. Attribute
+values are checked after HTML character references are decoded once,
+so encoded spellings such as "jav&#x61;script:" are caught; tag
+names are not decoded, because browsers do not decode them either.
+CSS text (style attributes and <style> blocks) is checked after CSS
+escape sequences are decoded once, so "url(\\6a avascript:...)" is
+caught as javascript:; the url() function name and the @import
+keyword may themselves be escape-encoded and are still recognised.
+The template path is unchanged; the direct path is what makes a
+rebuild look like the original instead of a generic sketch.
 
 Safety rules, enforced here:
 - All text from the layout is HTML-escaped.
@@ -211,6 +215,108 @@ _CSS_URL = re.compile(
     r"""url\s*\(\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^)]*?))\s*\)""",
     re.IGNORECASE)
 
+# CSS @import: url(...) form, or a bare quoted string, with optional
+# whitespace or /* comments */ between the keyword and the URL and
+# optional layer / supports() / media queries after it (ignored).
+# The url(...) alternative is tried first so the string inside it is
+# not also matched as a bare-string import. "@import" with no URL
+# is invalid CSS and is ignored by browsers, so it is ignored here.
+_CSS_IMPORT = re.compile(
+    r"""@import(?:\s|/\*.*?\*/)*"""
+    r"""(?:url\s*\(\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^)]*?))\s*\)"""
+    r"""|"(?P<dq2>[^"]*)"|'(?P<sq2>[^']*)')""",
+    re.IGNORECASE | re.DOTALL)
+
+# CSS text lives in style attributes (quoted or unquoted) and in
+# <style> blocks. The block body runs to the first </style> or to
+# the end of the document (an unclosed <style> swallows the rest).
+_STYLE_ATTR = re.compile(
+    r"""(?<![\w-])style\s*=\s*"""
+    r"""(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))""",
+    re.IGNORECASE)
+_STYLE_BLOCK = re.compile(
+    r"<style\b[^>]*>(?P<body>.*?)(?:</style\s*>|$)",
+    re.IGNORECASE | re.DOTALL)
+
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_CSS_WS = " \t\n\r\f"
+
+
+def _css_unescape(text: str) -> str:
+    """Decode CSS escape sequences the way browsers do (CSS Syntax
+    Module Level 3, section 4.3.7, "consume an escaped code point").
+
+    Decodes exactly once, left to right — a decoded backslash never
+    starts a second escape, matching the browser's single tokenizing
+    pass ("\\5c 6a..." decodes to the literal text "\\6a...", not
+    to "j"):
+    - backslash + 1-6 hex digits + one optional whitespace (the
+      terminator, CRLF counting as one) -> that code point;
+      NUL, surrogates, and values above U+10FFFF become U+FFFD.
+    - backslash + newline (LF, CR, FF, or CRLF) -> nothing: a line
+      continuation, escape and newline both dropped.
+    - backslash + any other character -> that character literally
+      ("\\j" is "j", "\\:" is ":", "\\/" is "/").
+    - a trailing lone backslash -> U+FFFD.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= n:
+            out.append("\ufffd")
+            i += 1
+            continue
+        nxt = text[i + 1]
+        if nxt in "\n\r\f":
+            # Line continuation: escape + newline are dropped.
+            i += 2
+            if nxt == "\r" and i < n and text[i] == "\n":
+                i += 1
+            continue
+        if nxt in _HEX_DIGITS:
+            j = i + 1
+            digits = ""
+            while j < n and len(digits) < 6 and text[j] in _HEX_DIGITS:
+                digits += text[j]
+                j += 1
+            # One optional whitespace terminator (CRLF counts as one).
+            if j < n and text[j] in _CSS_WS:
+                if text[j] == "\r" and j + 1 < n and text[j + 1] == "\n":
+                    j += 2
+                else:
+                    j += 1
+            value = int(digits, 16)
+            if value == 0 or value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                out.append("\ufffd")
+            else:
+                out.append(chr(value))
+            i = j
+            continue
+        # Backslash + any other character: that character literally.
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+
+def _css_segments(decoded: str):
+    """The CSS text of a document: style attribute values and
+    <style> block bodies. Only CSS is parsed as CSS — the
+    escape-normalized url() and @import checks run on these
+    segments. (A separate whole-document url() backstop in
+    scan_direct_violations keeps the follow-up-2 refusal of a
+    "url(...)" in visible text or a malformed attribute; see there.)
+    """
+    for match in _STYLE_ATTR.finditer(decoded):
+        yield _attr_value(match)
+    for match in _STYLE_BLOCK.finditer(decoded):
+        yield match.group("body")
+
 # <meta http-equiv="refresh" content="0;url=...">: http-equiv and
 # content may each be quoted or unquoted; the url inside content may
 # be quoted or bare.
@@ -240,8 +346,9 @@ def _attr_value(match):
 
     All attribute regexes below use the same named groups (dq / sq /
     bare), so this works for script src, resource URLs, and srcset.
+    The @import pattern adds dq2 / sq2 for its bare-string form.
     """
-    for group in ("dq", "sq", "bare"):
+    for group in ("dq", "sq", "bare", "dq2", "sq2"):
         value = match.group(group)
         if value is not None:
             return value
@@ -310,9 +417,14 @@ def scan_direct_violations(html_doc: str) -> list:
     be entity-encoded), unsafe URL schemes (javascript:, vbscript:,
     data:, including entity-encoded or control-character-padded
     spellings), and non-allowlisted external URLs in src, href,
-    action, formaction, srcset (quoted or unquoted), CSS url(), and
-    meta-refresh URLs. The scan never cleans anything: callers refuse
-    on any violation, with the named reason.
+    action, formaction, srcset (quoted or unquoted), CSS url() and
+    CSS @import (quoted, unquoted, and bare-string forms, with
+    layer / supports() / media queries ignored), and meta-refresh
+    URLs. CSS text is escape-decoded once before checking, so
+    escape-encoded schemes ("\\6a avascript:"), escape-encoded
+    function names ("u\\72l(...)"), and escape-encoded keywords
+    ("@\\69mport") are caught. The scan never cleans anything:
+    callers refuse on any violation, with the named reason.
     """
     violations = []
     text = html_doc or ""
@@ -364,9 +476,43 @@ def scan_direct_violations(html_doc: str) -> list:
             parts = candidate.strip().split()
             if parts:
                 _check_resource_url("srcset", parts[0], violations)
-    # --- CSS url(...) in style attributes and <style> blocks ---
-    for match in _CSS_URL.finditer(decoded):
-        _check_resource_url("css url()", _attr_value(match), violations)
+    # --- CSS url() and @import in style attributes and <style> blocks ---
+    # CSS text is escape-decoded first: browsers decode CSS escapes
+    # while tokenizing CSS, so "url(\\6a avascript:...)" is
+    # javascript: to a browser, "u\\72l(...)" is url(), and
+    # "@\\69mport" is @import. Decoding happens once, left to right,
+    # and only inside real CSS (style attributes and <style> blocks):
+    # a backslash in an HTML attribute URL is literal there, not a
+    # CSS escape, so resource URLs and meta-refresh URLs are NOT
+    # CSS-decoded.
+    for css_text in _css_segments(decoded):
+        normalized = _css_unescape(css_text)
+        for match in _CSS_URL.finditer(normalized):
+            _check_resource_url("css url()", _attr_value(match),
+                                violations)
+        for match in _CSS_IMPORT.finditer(normalized):
+            _check_resource_url("css @import", _attr_value(match),
+                                violations)
+    # Backstop: the whole-document url() scan from follow-up 2, run
+    # on both the decoded text and the CSS-normalized text, for both
+    # url() and @import. Segment extraction follows HTML attribute
+    # quoting, so a style attribute whose value itself contains a
+    # quote — <div style="background:url("javascript:alert(1)")">
+    # — ends at the inner quote and the segment only holds
+    # "background:url(". Browsers parse that as a truncated
+    # attribute (no fetch), but the follow-up-2 tests refuse the raw
+    # text, and the backstop keeps that refusal — including when
+    # the scheme inside the quotes is escape-encoded. The
+    # normalized pass can also refuse a "url(...)" or "@import" in
+    # visible text, a comment, or a non-style attribute — a
+    # safe-direction false positive inherited from follow-up 2.
+    for haystack in (decoded, _css_unescape(decoded)):
+        for match in _CSS_URL.finditer(haystack):
+            _check_resource_url("css url()", _attr_value(match),
+                                violations)
+        for match in _CSS_IMPORT.finditer(haystack):
+            _check_resource_url("css @import", _attr_value(match),
+                                violations)
     # --- <meta http-equiv="refresh" content="0;url=..."> ---
     for tag_match in _META_TAG.finditer(decoded):
         tag = tag_match.group(0)
@@ -384,7 +530,16 @@ def scan_direct_violations(html_doc: str) -> list:
             continue
         _check_resource_url("meta refresh", _attr_value(url_match),
                             violations)
-    return violations
+    # Identical findings from the segment scan and the backstop are
+    # one finding, not two: drop exact (code, message) duplicates,
+    # keeping first-occurrence order.
+    seen = set()
+    unique = []
+    for code, message in violations:
+        if (code, message) not in seen:
+            seen.add((code, message))
+            unique.append((code, message))
+    return unique
 
 
 def _check_direct_html(html_doc: str) -> None:
