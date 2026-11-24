@@ -1,0 +1,20 @@
+{
+  "worktree": "/home/hatch/workspace/vektorshot-fu3",
+  "page": "pages/u.html",
+  "scan_codes": [],
+  "generate": {
+    "result": "PASS",
+    "title": "Utility render test",
+    "html_len": 1244
+  },
+  "check_generated": {
+    "passed": true,
+    "issues": [],
+    "requires_live_render": true
+  },
+  "check_raw": {
+    "passed": true,
+    "issues": [],
+    "requires_live_render": true
+  }
+}
